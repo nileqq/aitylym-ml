@@ -1,0 +1,5 @@
+recording_idx,source_id,duration_sec,reason
+67,1716,42.12,audio >= 40 sec
+315,1932,42.18,audio >= 40 sec
+397,1932,42.36,audio >= 40 sec
+501,1735,43.32,audio >= 40 sec

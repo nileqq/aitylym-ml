@@ -1,0 +1,5 @@
+{
+  "model": "omniASR_CTC_300M_v2",
+  "processed_samples": 852,
+  "cumulative_inference_time": 79.11745155799417
+}
