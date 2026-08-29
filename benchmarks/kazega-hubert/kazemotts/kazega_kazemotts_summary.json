@@ -1,0 +1,58 @@
+{
+  "model": "kazega0/KazEGA-HuBERT",
+  "dataset": "KazEmoTTS",
+  "evaluation_split": "test only",
+  "samples": 3730,
+  "used_audio_hours": 5.001771822916666,
+  "truncated_over_10_sec": 89,
+  "accuracy": 0.2453083109919571,
+  "balanced_accuracy": 0.23153372215021992,
+  "macro_precision": 0.2867274481488868,
+  "macro_recall": 0.23153372215021992,
+  "macro_f1": 0.17118255828952014,
+  "weighted_precision": 0.28548770542886537,
+  "weighted_recall": 0.2453083109919571,
+  "weighted_f1": 0.17667345576786586,
+  "mean_confidence": 0.5149966536074797,
+  "disgusted_predictions": 8,
+  "disgusted_prediction_rate": 0.0021447721179624667,
+  "ground_truth_distribution": {
+    "angry": 655,
+    "fearful": 575,
+    "happy": 622,
+    "neutral": 681,
+    "sad": 602,
+    "surprised": 595
+  },
+  "prediction_distribution": {
+    "happy": 443,
+    "neutral": 2676,
+    "angry": 224,
+    "sad": 330,
+    "fearful": 21,
+    "surprised": 28,
+    "disgusted": 8
+  },
+  "per_speaker": {
+    "akzhol": {
+      "samples": 1981,
+      "accuracy": 0.2569409389197375,
+      "macro_f1": 0.17997579520223672
+    },
+    "madi": {
+      "samples": 516,
+      "accuracy": 0.19767441860465115,
+      "macro_f1": 0.10944157823015166
+    },
+    "marzhan": {
+      "samples": 1233,
+      "accuracy": 0.24655312246553124,
+      "macro_f1": 0.17778274127227808
+    }
+  },
+  "model_load_seconds": 1.6009453000006033,
+  "inference_seconds": 90.18865769996773,
+  "rtf": 0.005008706075290132,
+  "realtime_speed": 199.652362300392,
+  "peak_vram_gb": 0.3540215492248535
+}

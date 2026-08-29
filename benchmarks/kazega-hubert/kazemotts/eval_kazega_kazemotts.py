@@ -1,0 +1,2065 @@
+import csv
+import io
+import json
+import math
+import os
+import time
+from collections import Counter
+from pathlib import Path
+
+import librosa
+import numpy as np
+import soundfile as sf
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from datasets import Audio, concatenate_datasets, load_dataset
+import requests
+from huggingface_hub import hf_hub_download, list_repo_files
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_recall_fscore_support,
+)
+from tqdm import tqdm
+from transformers import HubertModel, Wav2Vec2FeatureExtractor
+
+DOWNLOAD_ATTEMPTS = 8
+
+
+def download_with_retry(**kwargs):
+    """
+    hf_hub_download that survives flaky connections.
+
+    Partial downloads are resumed from the .incomplete
+    file, so a retry never restarts from zero.
+    """
+
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+
+        try:
+            return hf_hub_download(**kwargs)
+
+        except (
+            requests.exceptions.RequestException,
+            OSError,
+        ) as error:
+
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+
+            wait = min(60, 2 ** attempt)
+
+            print(
+                f"  Download failed "
+                f"(attempt {attempt}/{DOWNLOAD_ATTEMPTS}): "
+                f"{type(error).__name__}. "
+                f"Retrying in {wait}s..."
+            )
+
+            time.sleep(wait)
+
+
+def get_test_parquet_files(speaker: str):
+    """
+    Resolve and download exactly the TEST parquet shards
+    for this speaker from the Hugging Face
+    auto-converted parquet branch.
+
+    This avoids downloading train and avoids
+    hardcoding parquet filenames.
+    """
+
+    print(f"Getting TEST parquet files for {speaker}...")
+
+    repo_files = list_repo_files(
+        DATASET_REPO,
+        repo_type="dataset",
+        revision=PARQUET_REVISION,
+    )
+
+    shard_names = sorted(
+        name
+        for name in repo_files
+        if name.startswith(f"{speaker}/test/")
+        and name.endswith(".parquet")
+    )
+
+    if not shard_names:
+        raise RuntimeError(
+            f"No TEST parquet files found for {speaker}"
+        )
+
+    print(
+        f"Found {len(shard_names)} test parquet file(s)"
+    )
+
+    # Download only those shards.
+    # TRAIN shards are never touched.
+    return [
+        download_with_retry(
+            repo_id=DATASET_REPO,
+            repo_type="dataset",
+            revision=PARQUET_REVISION,
+            filename=name,
+        )
+        for name in shard_names
+    ]
+
+
+# ============================================================
+# CONSOLE
+# ============================================================
+
+# The Windows console defaults to cp1251 here, which cannot
+# encode the arrows used in the report.
+import sys
+
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(
+            encoding="utf-8",
+            errors="replace",
+        )
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+MODEL_REPO = "kazega0/KazEGA-HuBERT"
+BASE_MODEL = "facebook/hubert-base-ls960"
+
+DATASET_REPO = "ai4kazakh/ISSAI_KazEmoTTS"
+
+# Auto-converted parquet branch of the dataset repo.
+PARQUET_REVISION = "refs/convert/parquet"
+
+SAMPLE_RATE = 16_000
+
+# Official KazEGA-HuBERT setup:
+# use at most first 10 seconds.
+MAX_LENGTH = 160_000
+
+# RTX 4060 Laptop 8 GB.
+# Start safely.
+BATCH_SIZE = 4
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+
+# ============================================================
+# IMPORTANT:
+# ONLY TEST PARQUET FILES
+#
+# We deliberately DO NOT call:
+#
+# load_dataset(DATASET_REPO, "akzhol", split="test")
+#
+# because that configuration caused HF datasets to download
+# train shards as well.
+#
+# Instead we download only the TEST parquet shards from the
+# auto-converted parquet branch.
+# ============================================================
+DATASET_REPO = "ai4kazakh/ISSAI_KazEmoTTS"
+
+SPEAKERS = [
+    "akzhol",
+    "madi",
+    "marzhan",
+]
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
+OUTPUT_DIR = Path(__file__).resolve().parent
+
+CHECKPOINT_CSV = (
+    OUTPUT_DIR
+    / "kazega_kazemotts_checkpoint.csv"
+)
+
+STATE_JSON = (
+    OUTPUT_DIR
+    / "kazega_kazemotts_state.json"
+)
+
+RESULTS_CSV = (
+    OUTPUT_DIR
+    / "kazega_kazemotts_results.csv"
+)
+
+SUMMARY_JSON = (
+    OUTPUT_DIR
+    / "kazega_kazemotts_summary.json"
+)
+
+PER_CLASS_CSV = (
+    OUTPUT_DIR
+    / "kazega_kazemotts_per_class.csv"
+)
+
+CONFUSION_CSV = (
+    OUTPUT_DIR
+    / "kazega_kazemotts_confusion_matrix.csv"
+)
+
+
+FIELDS = [
+    "recording_idx",
+    "speaker",
+    "ground_truth",
+    "prediction",
+    "confidence",
+    "correct",
+    "duration_sec",
+    "used_duration_sec",
+    "truncated",
+]
+
+
+# ============================================================
+# LABELS
+# ============================================================
+
+# KazEmoTTS:
+#
+# neutral
+# angry
+# happy
+# sad
+# scared
+# surprised
+#
+# KazEGA-HuBERT calls "scared" -> "fearful".
+
+GT_MAPPING = {
+    "neutral": "neutral",
+    "angry": "angry",
+    "happy": "happy",
+    "sad": "sad",
+
+    "scared": "fearful",
+    "fear": "fearful",
+    "fearful": "fearful",
+
+    "surprise": "surprised",
+    "surprised": "surprised",
+}
+
+
+# Six actual GT classes.
+EVAL_CLASSES = [
+    "angry",
+    "fearful",
+    "happy",
+    "neutral",
+    "sad",
+    "surprised",
+]
+
+
+# KazEGA-HuBERT has an extra possible prediction:
+# disgusted.
+MODEL_CLASSES = [
+    "angry",
+    "disgusted",
+    "fearful",
+    "happy",
+    "neutral",
+    "sad",
+    "surprised",
+]
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+class MultiTaskHubert(nn.Module):
+
+    def __init__(
+        self,
+        num_emotions,
+        num_genders,
+        num_ages,
+    ):
+        super().__init__()
+
+        # IMPORTANT:
+        # The actual model.pt checkpoint uses backbone.*
+        self.backbone = HubertModel.from_pretrained(
+            BASE_MODEL,
+            output_hidden_states=True,
+        )
+
+        hidden_size = (
+            self.backbone.config.hidden_size
+        )
+
+        num_layers = (
+            self.backbone.config.num_hidden_layers + 1
+        )
+
+
+        # Learnable weights across HuBERT layers
+        self.emotion_weights = nn.Parameter(
+            torch.ones(num_layers)
+        )
+
+        self.gender_weights = nn.Parameter(
+            torch.ones(num_layers)
+        )
+
+        self.age_weights = nn.Parameter(
+            torch.ones(num_layers)
+        )
+
+
+        # Emotion head
+        self.emotion_head = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_emotions),
+        )
+
+
+        # Gender head
+        self.gender_head = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, num_genders),
+        )
+
+
+        # Age head
+        self.age_head = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, num_ages),
+        )
+
+
+    def forward(
+        self,
+        input_values,
+        input_lengths,
+    ):
+
+        outputs = self.backbone(
+            input_values,
+            output_hidden_states=True,
+        )
+
+        # [layers, batch, time, hidden]
+        hidden = torch.stack(
+            outputs.hidden_states,
+            dim=0,
+        )
+
+
+        # Raw audio lengths -> HuBERT feature lengths
+        feature_lengths = (
+            self.backbone
+            ._get_feat_extract_output_lengths(
+                input_lengths
+            )
+        )
+
+
+        def weighted_pool(layer_weights):
+
+            weights = torch.softmax(
+                layer_weights,
+                dim=0,
+            )
+
+            # weighted sum across HuBERT layers
+            features = (
+                weights[:, None, None, None]
+                * hidden
+            ).sum(dim=0)
+
+            # features:
+            # [batch, time, hidden]
+
+            pooled = []
+
+            for batch_idx in range(
+                features.shape[0]
+            ):
+
+                feature_length = int(
+                    feature_lengths[
+                        batch_idx
+                    ].item()
+                )
+
+                valid_features = features[
+                    batch_idx,
+                    :feature_length,
+                    :
+                ]
+
+                pooled.append(
+                    valid_features.mean(
+                        dim=0
+                    )
+                )
+
+            return torch.stack(
+                pooled,
+                dim=0,
+            )
+
+
+        emotion_features = weighted_pool(
+            self.emotion_weights
+        )
+
+        gender_features = weighted_pool(
+            self.gender_weights
+        )
+
+        age_features = weighted_pool(
+            self.age_weights
+        )
+
+
+        return (
+            self.emotion_head(
+                emotion_features
+            ),
+
+            self.gender_head(
+                gender_features
+            ),
+
+            self.age_head(
+                age_features
+            ),
+        )
+
+
+# ============================================================
+# AUDIO
+# ============================================================
+
+def load_audio(sample):
+
+    audio = sample["audio"]
+
+    audio_bytes = audio.get("bytes")
+    audio_path = audio.get("path")
+
+
+    if audio_bytes is not None:
+
+        waveform, sr = sf.read(
+            io.BytesIO(audio_bytes),
+            dtype="float32",
+        )
+
+    elif audio_path is not None:
+
+        waveform, sr = sf.read(
+            audio_path,
+            dtype="float32",
+        )
+
+    else:
+
+        raise RuntimeError(
+            "Audio contains neither bytes nor path"
+        )
+
+
+    # Stereo -> mono
+    if waveform.ndim > 1:
+
+        waveform = waveform.mean(
+            axis=1
+        )
+
+
+    waveform = np.asarray(
+        waveform,
+        dtype=np.float32,
+    )
+
+
+    # Resample if needed
+    if sr != SAMPLE_RATE:
+
+        waveform = librosa.resample(
+            waveform,
+            orig_sr=sr,
+            target_sr=SAMPLE_RATE,
+        )
+
+
+    duration_sec = (
+        len(waveform)
+        / SAMPLE_RATE
+    )
+
+
+    # KazEGA official setup:
+    # first maximum 10 sec
+    truncated = (
+        len(waveform)
+        > MAX_LENGTH
+    )
+
+    waveform = waveform[
+        :MAX_LENGTH
+    ]
+
+    true_length = len(
+        waveform
+    )
+
+    used_duration_sec = (
+        true_length
+        / SAMPLE_RATE
+    )
+
+
+    # Pad to exactly 10 sec
+    if true_length < MAX_LENGTH:
+
+        waveform = np.pad(
+            waveform,
+            (
+                0,
+                MAX_LENGTH - true_length,
+            ),
+        )
+
+
+    return (
+        waveform,
+        true_length,
+        duration_sec,
+        used_duration_sec,
+        truncated,
+    )
+
+
+# ============================================================
+# CHECKPOINT
+# ============================================================
+
+def append_checkpoint(rows):
+
+    with CHECKPOINT_CSV.open(
+        "a",
+        encoding="utf-8",
+        newline="",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=FIELDS,
+        )
+
+        writer.writerows(
+            rows
+        )
+
+        # Ensure checkpoint really reaches disk
+        file.flush()
+        os.fsync(
+            file.fileno()
+        )
+
+
+STATE_REPLACE_ATTEMPTS = 10
+
+
+def save_state(
+    processed_samples,
+    cumulative_inference_time,
+):
+
+    state = {
+        "model": MODEL_REPO,
+        "dataset": "KazEmoTTS TEST only",
+        "processed_samples": processed_samples,
+        "cumulative_inference_time":
+            cumulative_inference_time,
+    }
+
+
+    tmp_file = STATE_JSON.with_suffix(
+        ".tmp"
+    )
+
+
+    with tmp_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            state,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        file.flush()
+        os.fsync(
+            file.fileno()
+        )
+
+
+    # OneDrive-synced folders intermittently lock the target
+    # file, which makes os.replace raise WinError 5.
+    # Retry briefly instead of losing the whole run.
+    for attempt in range(1, STATE_REPLACE_ATTEMPTS + 1):
+
+        try:
+            tmp_file.replace(
+                STATE_JSON
+            )
+
+            return
+
+        except PermissionError:
+
+            if attempt == STATE_REPLACE_ATTEMPTS:
+                raise
+
+            time.sleep(0.5 * attempt)
+
+
+# ============================================================
+# START
+# ============================================================
+
+print()
+print("=" * 80)
+print(
+    "KazEGA-HuBERT — KazEmoTTS TEST BENCHMARK"
+)
+print("=" * 80)
+
+print(
+    f"Device: {DEVICE}"
+)
+
+if torch.cuda.is_available():
+
+    print(
+        "GPU:",
+        torch.cuda.get_device_name(0),
+    )
+
+
+# ============================================================
+# 1. LOAD ONLY TEST PARQUETS
+# ============================================================
+
+print()
+print(
+    "[1/6] Loading ONLY KazEmoTTS TEST parquet files..."
+)
+
+parts = []
+
+
+for speaker in SPEAKERS:
+
+    print()
+    print(
+        f"Loading {speaker}/test..."
+    )
+
+
+    # Get exact TEST parquet URL(s)
+    # from Hugging Face API.
+    parquet_files = get_test_parquet_files(
+        speaker
+    )
+
+
+    for path in parquet_files:
+        print(
+            f"  TEST file: {path}"
+        )
+
+
+    # IMPORTANT:
+    # We use generic parquet loader.
+    #
+    # It only sees the local shards downloaded
+    # specifically for the TEST split.
+    #
+    # Therefore TRAIN cannot be downloaded.
+    part = load_dataset(
+        "parquet",
+
+        data_files={
+            "test": parquet_files,
+        },
+
+        split="test",
+    )
+
+
+    # Keep encoded audio.
+    part = part.cast_column(
+        "audio",
+        Audio(decode=False),
+    )
+
+
+    # Remember speaker identity
+    part = part.add_column(
+        "speaker_name",
+        [speaker] * len(part),
+    )
+
+
+    parts.append(
+        part
+    )
+
+
+dataset = concatenate_datasets(
+    parts
+)
+
+
+print()
+print("=" * 80)
+
+print(
+    f"TOTAL TEST RECORDINGS: "
+    f"{len(dataset):,}"
+)
+
+print("=" * 80)
+
+# ============================================================
+# LABEL SANITY CHECK
+# ============================================================
+
+raw_distribution = Counter(
+    str(label).lower()
+    for label
+    in dataset["emotion"]
+)
+
+
+print()
+print("Ground-truth labels:")
+
+
+for label, count in sorted(
+    raw_distribution.items()
+):
+
+    print(
+        f"  {label:12s}: "
+        f"{count:,}"
+    )
+
+
+unknown_labels = [
+    label
+    for label
+    in raw_distribution
+    if label
+    not in GT_MAPPING
+]
+
+
+if unknown_labels:
+
+    raise RuntimeError(
+        "Unknown KazEmoTTS emotion labels: "
+        f"{unknown_labels}"
+    )
+
+
+# ============================================================
+# 2. FEATURE EXTRACTOR
+# ============================================================
+
+print()
+print(
+    "[2/6] Loading Wav2Vec2FeatureExtractor..."
+)
+
+
+processor = (
+    Wav2Vec2FeatureExtractor
+    .from_pretrained(
+        BASE_MODEL
+    )
+)
+
+
+print(
+    "Feature extractor OK"
+)
+
+
+# ============================================================
+# 3. LOAD MODEL
+# ============================================================
+
+print()
+print(
+    "[3/6] Loading KazEGA-HuBERT..."
+)
+
+
+model_path = download_with_retry(
+    repo_id=MODEL_REPO,
+    filename="model.pt",
+)
+
+
+labels_path = download_with_retry(
+    repo_id=MODEL_REPO,
+    filename="label_encoders.json",
+)
+
+
+with open(
+    labels_path,
+    "r",
+    encoding="utf-8",
+) as file:
+
+    encoders = json.load(
+        file
+    )
+
+
+id2label = {
+    task: {
+        idx: label
+        for label, idx
+        in mapping.items()
+    }
+    for task, mapping
+    in encoders.items()
+}
+
+
+print(
+    "Emotion labels:",
+    id2label["emotion"]
+)
+
+
+checkpoint = torch.load(
+    model_path,
+    map_location="cpu",
+    weights_only=False,
+)
+
+
+model_load_start = (
+    time.perf_counter()
+)
+
+
+model = MultiTaskHubert(
+    checkpoint["num_emotions"],
+    checkpoint["num_genders"],
+    checkpoint["num_ages"],
+)
+
+
+# Actual checkpoint uses backbone.*
+# Our class also uses self.backbone,
+# so no key remapping should be required.
+model.load_state_dict(
+    checkpoint["model_state_dict"],
+    strict=True,
+)
+
+
+model.to(
+    DEVICE
+)
+
+model.eval()
+
+
+model_load_time = (
+    time.perf_counter()
+    - model_load_start
+)
+
+
+print(
+    f"Model loaded successfully "
+    f"in {model_load_time:.2f} sec"
+)
+
+
+if torch.cuda.is_available():
+
+    torch.cuda.empty_cache()
+
+    torch.cuda.reset_peak_memory_stats()
+
+
+# ============================================================
+# 4. RESTORE CHECKPOINT
+# ============================================================
+
+print()
+print(
+    "[4/6] Restoring benchmark checkpoint..."
+)
+
+
+processed = set()
+
+cumulative_inference_time = 0.0
+
+
+if CHECKPOINT_CSV.exists():
+
+    with CHECKPOINT_CSV.open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as file:
+
+        reader = csv.DictReader(
+            file
+        )
+
+        for row in reader:
+
+            processed.add(
+                int(
+                    row["recording_idx"]
+                )
+            )
+
+
+else:
+
+    with CHECKPOINT_CSV.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=FIELDS,
+        )
+
+        writer.writeheader()
+
+
+if STATE_JSON.exists():
+
+    with STATE_JSON.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+
+        state = json.load(
+            file
+        )
+
+
+    # Don't silently resume incompatible old run.
+    if (
+        state.get("dataset")
+        != "KazEmoTTS TEST only"
+    ):
+
+        raise RuntimeError(
+            "Old incompatible state file detected. "
+            "Delete checkpoint/state and restart."
+        )
+
+
+    cumulative_inference_time = float(
+        state.get(
+            "cumulative_inference_time",
+            0.0,
+        )
+    )
+
+
+remaining = [
+    idx
+    for idx in range(
+        len(dataset)
+    )
+    if idx not in processed
+]
+
+
+print(
+    f"Already processed : "
+    f"{len(processed):,}"
+)
+
+print(
+    f"Remaining         : "
+    f"{len(remaining):,}"
+)
+
+
+# ============================================================
+# 5. INFERENCE
+# ============================================================
+
+print()
+print(
+    "[5/6] Running inference..."
+)
+
+print(
+    f"Batch size: "
+    f"{BATCH_SIZE}"
+)
+
+
+num_batches = math.ceil(
+    len(remaining)
+    / BATCH_SIZE
+)
+
+
+for start in tqdm(
+    range(
+        0,
+        len(remaining),
+        BATCH_SIZE,
+    ),
+
+    total=num_batches,
+
+    desc="KazEGA-HuBERT",
+    unit="batch",
+):
+
+
+    batch_indices = remaining[
+        start:
+        start + BATCH_SIZE
+    ]
+
+
+    waveforms = []
+    true_lengths = []
+    metadata = []
+
+
+    # --------------------------------------------------------
+    # PREPARE BATCH
+    # --------------------------------------------------------
+
+    for recording_idx in batch_indices:
+
+        sample = dataset[
+            recording_idx
+        ]
+
+
+        (
+            waveform,
+            true_length,
+            duration_sec,
+            used_duration_sec,
+            truncated,
+        ) = load_audio(
+            sample
+        )
+
+
+        raw_label = str(
+            sample["emotion"]
+        ).lower()
+
+
+        ground_truth = (
+            GT_MAPPING[
+                raw_label
+            ]
+        )
+
+
+        waveforms.append(
+            waveform
+        )
+
+        true_lengths.append(
+            true_length
+        )
+
+
+        metadata.append({
+            "recording_idx":
+                recording_idx,
+
+            "speaker":
+                sample["speaker_name"],
+
+            "ground_truth":
+                ground_truth,
+
+            "duration_sec":
+                duration_sec,
+
+            "used_duration_sec":
+                used_duration_sec,
+
+            "truncated":
+                int(truncated),
+        })
+
+
+    # --------------------------------------------------------
+    # FEATURE EXTRACTION
+    # --------------------------------------------------------
+
+    inputs = processor(
+        waveforms,
+
+        sampling_rate=SAMPLE_RATE,
+
+        return_tensors="pt",
+    )
+
+
+    input_values = (
+        inputs
+        .input_values
+        .to(DEVICE)
+    )
+
+
+    lengths_tensor = torch.tensor(
+        true_lengths,
+        dtype=torch.long,
+        device=DEVICE,
+    )
+
+
+    # --------------------------------------------------------
+    # INFERENCE TIMING
+    # --------------------------------------------------------
+
+    if torch.cuda.is_available():
+
+        torch.cuda.synchronize()
+
+
+    batch_start = (
+        time.perf_counter()
+    )
+
+
+    with torch.inference_mode():
+
+        (
+            emotion_logits,
+            _gender_logits,
+            _age_logits,
+        ) = model(
+            input_values,
+            lengths_tensor,
+        )
+
+
+    if torch.cuda.is_available():
+
+        torch.cuda.synchronize()
+
+
+    batch_elapsed = (
+        time.perf_counter()
+        - batch_start
+    )
+
+
+    cumulative_inference_time += (
+        batch_elapsed
+    )
+
+
+    # --------------------------------------------------------
+    # PREDICTIONS
+    # --------------------------------------------------------
+
+    probabilities = F.softmax(
+        emotion_logits,
+        dim=-1,
+    )
+
+
+    batch_rows = []
+
+
+    for local_idx, info in enumerate(
+        metadata
+    ):
+
+        class_idx = int(
+            probabilities[
+                local_idx
+            ].argmax()
+        )
+
+
+        prediction = (
+            id2label[
+                "emotion"
+            ][
+                class_idx
+            ]
+        )
+
+
+        confidence = float(
+            probabilities[
+                local_idx,
+                class_idx,
+            ].item()
+        )
+
+
+        correct = int(
+            prediction
+            == info["ground_truth"]
+        )
+
+
+        batch_rows.append({
+            "recording_idx":
+                info["recording_idx"],
+
+            "speaker":
+                info["speaker"],
+
+            "ground_truth":
+                info["ground_truth"],
+
+            "prediction":
+                prediction,
+
+            "confidence":
+                confidence,
+
+            "correct":
+                correct,
+
+            "duration_sec":
+                info["duration_sec"],
+
+            "used_duration_sec":
+                info["used_duration_sec"],
+
+            "truncated":
+                info["truncated"],
+        })
+
+
+    # --------------------------------------------------------
+    # CHECKPOINT AFTER EVERY GPU BATCH
+    # --------------------------------------------------------
+
+    append_checkpoint(
+        batch_rows
+    )
+
+
+    for info in metadata:
+
+        processed.add(
+            info["recording_idx"]
+        )
+
+
+    save_state(
+        processed_samples=len(
+            processed
+        ),
+
+        cumulative_inference_time=(
+            cumulative_inference_time
+        ),
+    )
+
+
+# ============================================================
+# 6. LOAD RESULTS
+# ============================================================
+
+print()
+print(
+    "[6/6] Calculating metrics..."
+)
+
+
+with CHECKPOINT_CSV.open(
+    "r",
+    encoding="utf-8",
+    newline="",
+) as file:
+
+    rows = list(
+        csv.DictReader(file)
+    )
+
+
+# ============================================================
+# SAFETY CHECKS
+# ============================================================
+
+recording_indices = [
+    int(
+        row["recording_idx"]
+    )
+    for row in rows
+]
+
+
+if len(recording_indices) != len(
+    set(recording_indices)
+):
+
+    raise RuntimeError(
+        "Duplicate recording_idx found "
+        "inside checkpoint!"
+    )
+
+
+if len(rows) != len(dataset):
+
+    raise RuntimeError(
+        "Benchmark incomplete: "
+        f"{len(rows):,} / "
+        f"{len(dataset):,}"
+    )
+
+
+rows.sort(
+    key=lambda row:
+        int(
+            row["recording_idx"]
+        )
+)
+
+
+# ============================================================
+# ARRAYS
+# ============================================================
+
+y_true = [
+    row["ground_truth"]
+    for row in rows
+]
+
+
+y_pred = [
+    row["prediction"]
+    for row in rows
+]
+
+
+# ============================================================
+# GLOBAL METRICS
+# ============================================================
+
+accuracy = accuracy_score(
+    y_true,
+    y_pred,
+)
+
+
+balanced_accuracy = (
+    balanced_accuracy_score(
+        y_true,
+        y_pred,
+    )
+)
+
+
+(
+    macro_precision,
+    macro_recall,
+    macro_f1,
+    _,
+) = precision_recall_fscore_support(
+    y_true,
+    y_pred,
+
+    labels=EVAL_CLASSES,
+
+    average="macro",
+
+    zero_division=0,
+)
+
+
+(
+    weighted_precision,
+    weighted_recall,
+    weighted_f1,
+    _,
+) = precision_recall_fscore_support(
+    y_true,
+    y_pred,
+
+    labels=EVAL_CLASSES,
+
+    average="weighted",
+
+    zero_division=0,
+)
+
+
+# ============================================================
+# PER-CLASS
+# ============================================================
+
+(
+    class_precision,
+    class_recall,
+    class_f1,
+    class_support,
+) = precision_recall_fscore_support(
+    y_true,
+    y_pred,
+
+    labels=EVAL_CLASSES,
+
+    zero_division=0,
+)
+
+
+per_class_rows = []
+
+
+for idx, label in enumerate(
+    EVAL_CLASSES
+):
+
+    per_class_rows.append({
+        "class": label,
+
+        "precision":
+            float(
+                class_precision[idx]
+            ),
+
+        "recall":
+            float(
+                class_recall[idx]
+            ),
+
+        "f1":
+            float(
+                class_f1[idx]
+            ),
+
+        "support":
+            int(
+                class_support[idx]
+            ),
+    })
+
+
+with PER_CLASS_CSV.open(
+    "w",
+    encoding="utf-8",
+    newline="",
+) as file:
+
+    writer = csv.DictWriter(
+        file,
+
+        fieldnames=[
+            "class",
+            "precision",
+            "recall",
+            "f1",
+            "support",
+        ],
+    )
+
+    writer.writeheader()
+
+    writer.writerows(
+        per_class_rows
+    )
+
+
+# ============================================================
+# 6 x 7 CONFUSION MATRIX
+# ============================================================
+
+confusion = {
+    true_label: {
+        predicted_label: 0
+        for predicted_label
+        in MODEL_CLASSES
+    }
+    for true_label
+    in EVAL_CLASSES
+}
+
+
+for true_label, predicted_label in zip(
+    y_true,
+    y_pred,
+):
+
+    confusion[
+        true_label
+    ][
+        predicted_label
+    ] += 1
+
+
+with CONFUSION_CSV.open(
+    "w",
+    encoding="utf-8",
+    newline="",
+) as file:
+
+    writer = csv.writer(
+        file
+    )
+
+    writer.writerow([
+        "true\\pred",
+        *MODEL_CLASSES,
+    ])
+
+
+    for true_label in EVAL_CLASSES:
+
+        writer.writerow([
+            true_label,
+
+            *[
+                confusion[
+                    true_label
+                ][
+                    predicted_label
+                ]
+                for predicted_label
+                in MODEL_CLASSES
+            ],
+        ])
+
+
+# ============================================================
+# DISTRIBUTIONS
+# ============================================================
+
+gt_distribution = Counter(
+    y_true
+)
+
+prediction_distribution = Counter(
+    y_pred
+)
+
+
+disgusted_count = (
+    prediction_distribution[
+        "disgusted"
+    ]
+)
+
+
+disgusted_rate = (
+    disgusted_count
+    / len(rows)
+)
+
+
+mean_confidence = float(
+    np.mean([
+        float(
+            row["confidence"]
+        )
+        for row in rows
+    ])
+)
+
+
+truncated_count = sum(
+    int(
+        row["truncated"]
+    )
+    for row in rows
+)
+
+
+# ============================================================
+# PER-SPEAKER
+# ============================================================
+
+speaker_results = {}
+
+
+for speaker in SPEAKERS:
+
+    speaker_rows = [
+        row
+        for row in rows
+        if row["speaker"] == speaker
+    ]
+
+
+    speaker_true = [
+        row["ground_truth"]
+        for row in speaker_rows
+    ]
+
+
+    speaker_pred = [
+        row["prediction"]
+        for row in speaker_rows
+    ]
+
+
+    speaker_accuracy = accuracy_score(
+        speaker_true,
+        speaker_pred,
+    )
+
+
+    (
+        _,
+        _,
+        speaker_macro_f1,
+        _,
+    ) = precision_recall_fscore_support(
+        speaker_true,
+        speaker_pred,
+
+        labels=EVAL_CLASSES,
+
+        average="macro",
+
+        zero_division=0,
+    )
+
+
+    speaker_results[
+        speaker
+    ] = {
+        "samples":
+            len(speaker_rows),
+
+        "accuracy":
+            float(
+                speaker_accuracy
+            ),
+
+        "macro_f1":
+            float(
+                speaker_macro_f1
+            ),
+    }
+
+
+# ============================================================
+# PERFORMANCE
+# ============================================================
+
+total_audio_seconds = sum(
+    float(
+        row["used_duration_sec"]
+    )
+    for row in rows
+)
+
+
+rtf = (
+    cumulative_inference_time
+    / total_audio_seconds
+)
+
+
+realtime_speed = (
+    1.0 / rtf
+)
+
+
+if torch.cuda.is_available():
+
+    peak_vram_gb = (
+        torch.cuda
+        .max_memory_allocated()
+        / (1024 ** 3)
+    )
+
+else:
+
+    peak_vram_gb = None
+
+
+# ============================================================
+# SAVE FINAL CSV
+# ============================================================
+
+with RESULTS_CSV.open(
+    "w",
+    encoding="utf-8",
+    newline="",
+) as file:
+
+    writer = csv.DictWriter(
+        file,
+        fieldnames=FIELDS,
+    )
+
+    writer.writeheader()
+
+    writer.writerows(
+        rows
+    )
+
+
+# ============================================================
+# SUMMARY JSON
+# ============================================================
+
+summary = {
+    "model":
+        MODEL_REPO,
+
+    "dataset":
+        "KazEmoTTS",
+
+    "evaluation_split":
+        "test only",
+
+    "samples":
+        len(rows),
+
+    "used_audio_hours":
+        total_audio_seconds / 3600,
+
+    "truncated_over_10_sec":
+        truncated_count,
+
+    "accuracy":
+        float(accuracy),
+
+    "balanced_accuracy":
+        float(
+            balanced_accuracy
+        ),
+
+    "macro_precision":
+        float(
+            macro_precision
+        ),
+
+    "macro_recall":
+        float(
+            macro_recall
+        ),
+
+    "macro_f1":
+        float(
+            macro_f1
+        ),
+
+    "weighted_precision":
+        float(
+            weighted_precision
+        ),
+
+    "weighted_recall":
+        float(
+            weighted_recall
+        ),
+
+    "weighted_f1":
+        float(
+            weighted_f1
+        ),
+
+    "mean_confidence":
+        mean_confidence,
+
+    "disgusted_predictions":
+        disgusted_count,
+
+    "disgusted_prediction_rate":
+        disgusted_rate,
+
+    "ground_truth_distribution":
+        dict(
+            gt_distribution
+        ),
+
+    "prediction_distribution":
+        dict(
+            prediction_distribution
+        ),
+
+    "per_speaker":
+        speaker_results,
+
+    "model_load_seconds":
+        model_load_time,
+
+    "inference_seconds":
+        cumulative_inference_time,
+
+    "rtf":
+        rtf,
+
+    "realtime_speed":
+        realtime_speed,
+
+    "peak_vram_gb":
+        peak_vram_gb,
+}
+
+
+with SUMMARY_JSON.open(
+    "w",
+    encoding="utf-8",
+) as file:
+
+    json.dump(
+        summary,
+        file,
+
+        ensure_ascii=False,
+
+        indent=2,
+    )
+
+
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+print()
+print("=" * 80)
+print("FINAL RESULTS")
+print("=" * 80)
+
+
+print()
+print("DATASET")
+print("-" * 80)
+
+print(
+    "Dataset              : "
+    "KazEmoTTS"
+)
+
+print(
+    "Split                : "
+    "TEST ONLY"
+)
+
+print(
+    f"Recordings           : "
+    f"{len(rows):,}"
+)
+
+print(
+    f"Used audio           : "
+    f"{total_audio_seconds / 3600:.2f} h"
+)
+
+print(
+    f"Truncated >10 sec    : "
+    f"{truncated_count:,}"
+)
+
+
+print()
+print("GLOBAL EMOTION METRICS")
+print("-" * 80)
+
+print(
+    f"Accuracy ↑           : "
+    f"{accuracy * 100:.2f}%"
+)
+
+print(
+    f"Balanced Accuracy ↑  : "
+    f"{balanced_accuracy * 100:.2f}%"
+)
+
+print(
+    f"Macro Precision ↑    : "
+    f"{macro_precision * 100:.2f}%"
+)
+
+print(
+    f"Macro Recall ↑       : "
+    f"{macro_recall * 100:.2f}%"
+)
+
+print(
+    f"Macro F1 ↑           : "
+    f"{macro_f1 * 100:.2f}%"
+)
+
+print(
+    f"Weighted F1 ↑        : "
+    f"{weighted_f1 * 100:.2f}%"
+)
+
+print(
+    f"Mean confidence      : "
+    f"{mean_confidence * 100:.2f}%"
+)
+
+print(
+    f"Disgusted predictions: "
+    f"{disgusted_count:,} "
+    f"({disgusted_rate * 100:.2f}%)"
+)
+
+
+print()
+print("PER CLASS")
+print("-" * 80)
+
+
+for row in per_class_rows:
+
+    print(
+        f"{row['class']:12s} | "
+        f"P={row['precision'] * 100:6.2f}% | "
+        f"R={row['recall'] * 100:6.2f}% | "
+        f"F1={row['f1'] * 100:6.2f}% | "
+        f"N={row['support']:,}"
+    )
+
+
+print()
+print("PER SPEAKER")
+print("-" * 80)
+
+
+for speaker, values in (
+    speaker_results.items()
+):
+
+    print(
+        f"{speaker:10s} | "
+        f"N={values['samples']:5,d} | "
+        f"Accuracy="
+        f"{values['accuracy'] * 100:6.2f}% | "
+        f"Macro-F1="
+        f"{values['macro_f1'] * 100:6.2f}%"
+    )
+
+
+print()
+print("PREDICTION DISTRIBUTION")
+print("-" * 80)
+
+
+for label in MODEL_CLASSES:
+
+    count = prediction_distribution[
+        label
+    ]
+
+    print(
+        f"{label:12s}: "
+        f"{count:6,d} "
+        f"({count / len(rows) * 100:6.2f}%)"
+    )
+
+
+print()
+print("PERFORMANCE")
+print("-" * 80)
+
+print(
+    f"Model load time      : "
+    f"{model_load_time:.2f} sec"
+)
+
+print(
+    f"Inference time       : "
+    f"{cumulative_inference_time:.2f} sec"
+)
+
+print(
+    f"RTF ↓                : "
+    f"{rtf:.4f}"
+)
+
+print(
+    f"Realtime speed ↑     : "
+    f"{realtime_speed:.2f}x"
+)
+
+
+if peak_vram_gb is not None:
+
+    print(
+        f"Peak VRAM            : "
+        f"{peak_vram_gb:.2f} GB"
+    )
+
+
+print()
+print("OUTPUT")
+print("-" * 80)
+
+print(
+    f"Results:\n"
+    f"{RESULTS_CSV}"
+)
+
+print()
+
+print(
+    f"Summary:\n"
+    f"{SUMMARY_JSON}"
+)
+
+print()
+
+print(
+    f"Per-class:\n"
+    f"{PER_CLASS_CSV}"
+)
+
+print()
+
+print(
+    f"Confusion matrix:\n"
+    f"{CONFUSION_CSV}"
+)
+
+
+print()
+print("=" * 80)
+print("DONE")
+print("=" * 80)

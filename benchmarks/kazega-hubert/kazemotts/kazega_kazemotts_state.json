@@ -1,0 +1,6 @@
+{
+  "model": "kazega0/KazEGA-HuBERT",
+  "dataset": "KazEmoTTS TEST only",
+  "processed_samples": 3730,
+  "cumulative_inference_time": 90.18865769996773
+}
