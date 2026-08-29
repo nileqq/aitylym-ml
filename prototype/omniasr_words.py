@@ -47,7 +47,17 @@ SAMPLE_RATE = 16_000
 # Служебные id в словаре omniASR_tokenizer_written_v2
 BLANK_ID = 0
 SPACE_ID = 4
-_SPECIAL_IDS = (0, 1, 2)  # blank / bos / eos — все декодируются в пустую строку
+
+# 0/1/2 — blank/bos/eos, декодируются в пустую строку.
+# 3 — unk, и он декодируется как " ⁇ ", то есть с пробелами ВНУТРИ. Если его
+# не выбросить, он разорвёт слово и попадёт в текст. Проверено на словаре
+# omniASR_tokenizer_written_v2: id 4 — единственный, дающий чистый пробел.
+_SPECIAL_IDS = (0, 1, 2, 3)
+
+# CTC не растягивает букву на всю её длительность, а выдаёт пик где-то внутри,
+# обычно ближе к концу. Поэтому начало первого слова и конец последнего
+# сдвигаем на эту величину, иначе они прилипают к границам куска.
+_PEAK_LAG_FRAMES = 3  # ~60 мс
 
 # Длинное аудио режем: у трансформера внимание квадратично по длине,
 # на нескольких минутах разом кончится память.
@@ -140,10 +150,21 @@ def _split_into_chunks(waveform: np.ndarray) -> List[tuple]:
 
     chunks = []
     start = 0
+    last_end = None  # конец последней паузы, влезающей в лимит
+
     for _, seg_end in intervals:
-        if seg_end - start >= max_len:
-            chunks.append((start, waveform[start:seg_end]))
-            start = seg_end
+        if seg_end - start > max_len:
+            if last_end is not None and last_end > start:
+                # режем по последней паузе, которая ещё влезала
+                chunks.append((start, waveform[start:last_end]))
+                start = last_end
+            else:
+                # одна непрерывная реплика длиннее лимита — паузы нет,
+                # приходится резать посередине слова
+                hard_end = start + max_len
+                chunks.append((start, waveform[start:hard_end]))
+                start = hard_end
+        last_end = seg_end
 
     if start < len(waveform):
         chunks.append((start, waveform[start:]))
@@ -205,27 +226,40 @@ def _tokens_to_words(pipeline, kept, sec_per_frame, offset_sec, total_sec) -> Li
     import torch
 
     words: List[Word] = []
-    buf: List[int] = []
-    buf_start_frame: Optional[int] = None
-    prev_sep_frame = 0  # кадр предыдущего разделителя (начало текущего слова)
+    buf: List[tuple] = []  # (кадр, id)
+
+    # None означает "разделителя перед этим словом ещё не было", то есть слово
+    # первое в куске. Тогда опереться не на что и берём сам токен.
+    prev_sep_frame: Optional[int] = None
+
+    def to_sec(frame: int) -> float:
+        # float() обязателен: offset_sec приходит из numpy-индексов и тянет за
+        # собой np.float64, из-за чего у части слов типы разъезжаются
+        return float(frame * sec_per_frame + offset_sec)
 
     def flush(sep_frame: Optional[int]):
-        nonlocal buf, buf_start_frame, prev_sep_frame
+        nonlocal buf, prev_sep_frame
         if buf:
-            text = pipeline.token_decoder(torch.tensor(buf)).strip()
+            text = pipeline.token_decoder(
+                torch.tensor([token_id for _, token_id in buf])
+            ).strip()
             if text:
                 # границы по разделителям, а не по первой/последней букве
-                start = prev_sep_frame * sec_per_frame + offset_sec
-                if sep_frame is None:
-                    end = total_sec
+                if prev_sep_frame is None:
+                    start = to_sec(max(buf[0][0] - _PEAK_LAG_FRAMES, 0))
                 else:
-                    end = sep_frame * sec_per_frame + offset_sec
+                    start = to_sec(prev_sep_frame)
+
+                if sep_frame is None:
+                    end = min(to_sec(buf[-1][0] + _PEAK_LAG_FRAMES), total_sec)
+                else:
+                    end = to_sec(sep_frame)
+
                 if end > start:
                     words.append(
                         Word(word=text, start=round(start, 3), end=round(end, 3))
                     )
         buf = []
-        buf_start_frame = None
         if sep_frame is not None:
             prev_sep_frame = sep_frame
 
@@ -233,9 +267,7 @@ def _tokens_to_words(pipeline, kept, sec_per_frame, offset_sec, total_sec) -> Li
         if token_id == SPACE_ID:
             flush(frame)
         else:
-            if buf_start_frame is None:
-                buf_start_frame = frame
-            buf.append(token_id)
+            buf.append((frame, token_id))
 
     flush(None)
     return words
