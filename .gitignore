@@ -1,5 +1,7 @@
-data/
+data/*
+!data/benchmarks/
 .vscode/
 IMPORTANT/
 __pycache__/
 *.pyc
+.gradio/
