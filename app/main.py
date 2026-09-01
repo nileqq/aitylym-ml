@@ -10,7 +10,7 @@
 """
 
 import gradio as gr
-import vad, asr, prosody, librosa
+import vad, asr, emotion, prosody, librosa
 from html import escape
 from pathlib import Path
 import numpy as np
@@ -51,17 +51,22 @@ def process(audio_path):
     labels = [word for word, _, _ in found]
     spans = [(start, end) for _, start, end in found]
 
-    # TODO: эмоция
-    # даем это HUBert
-    #
-    # Эмоцию считать на отрезок VAD целиком, не на слово: на 300-500 мс
-    # модель неработоспособна, там побеждает фонетика, а не подача.
-    # Отрезки для этого уже есть — segments.
+    # Эмоция — на фразе, не на слове. На 300-500 мс модель неработоспособна:
+    # там побеждает фонетика, а не подача (замерено — смена текста двигает
+    # эмбеддинг в 2.29 раза сильнее, чем смена эмоции).
+    groups = emotion.group_words(spans)
+    phrase_spans = [(spans[g[0]][0], spans[g[-1]][1]) for g in groups]
+    phrase_probs = emotion.predict(y, sr, phrase_spans)
+
+    # Каждому слову — эмоция его фразы
+    per_word = [None] * len(spans)
+    for group, probs in zip(groups, phrase_probs):
+        top = max(probs, key=probs.get)
+        for i in group:
+            per_word[i] = (top, probs[top])
 
     # Просодия пословно
     values = prosody.analyze(y, sr, spans)
-
-    # TODO: покрасить по эмоции
 
     return [
         {
@@ -71,22 +76,46 @@ def process(audio_path):
             "loud": p.loud,
             "pitch": p.pitch,
             "voiced": p.voiced,
+            "emotion": per_word[i][0] if per_word[i] else "neutral",
+            "confidence": per_word[i][1] if per_word[i] else 0.0,
         }
-        for label, (start, end), p in zip(labels, spans, values)
+        for i, (label, (start, end), p) in enumerate(zip(labels, spans, values))
     ]
 
 
+# Оттенок под каждую эмоцию. Какой цвет какой эмоции соответствует у
+# казахоязычных зрителей — как раз то, что должен показать опрос; пока это
+# гипотеза. neutral без тона: серый.
+EMOTION_HUE = {
+    "neutral": None,
+    "happy": 48,
+    "angry": 5,
+    "fearful": 275,
+    "sad": 210,
+    "disgusted": 110,
+    "surprised": 25,
+}
+
+EMOTION_LABEL = {
+    "neutral": "бейтарап", "happy": "қуаныш", "angry": "ашу",
+    "fearful": "қорқыныш", "sad": "қайғы", "disgusted": "жиіркеніш",
+    "surprised": "таңданыс",
+}
+
+
 def render_card(result):
-    """Отрезки -> карточка, как будет выглядеть субтитр.
+    """Слова -> карточка, как будет выглядеть субтитр.
 
-    Подпись — само слово; если текста нет, показывается интервал времени.
+    Маппинг:
+        тон         <- эмоция ФРАЗЫ
+        насыщенность<- уверенность модели
+        светлота    <- громкость СЛОВА
+        размер      <- громкость СЛОВА  (у CuCap самое устойчивое
+                       соответствие: 29% NA / 38% KOR)
 
-    Маппинг сейчас временный:
-        размер <- громкость   (останется: у CuCap это самое устойчивое
-                               соответствие, 29% NA / 38% KOR)
-        цвет   <- высота      (заглушка: в итоге цвет несёт эмоцию, а
-                               высоту CuCap кодировать не советует —
-                               79% участников не сопоставили ей ничего)
+    Тон крутим в HSL, а не смешиваем цвета в RGB: у смеси середина уходит
+    в грязь. Высоту голоса отдельно не кодируем — 79% участников CuCap не
+    сопоставили ей ничего.
     """
     if not result:
         return "<div style='padding:32px;text-align:center;opacity:.5'>—</div>"
@@ -95,20 +124,26 @@ def render_card(result):
     for item in result:
         size = 18 + 26 * item["loud"]
 
-        if item["voiced"]:
-            # Тон от синего (низкий голос) к оранжевому (высокий).
-            # Крутим оттенок в HSL, а не смешиваем два цвета в RGB:
-            # у смеси середина всегда уходит в грязь.
-            hue = 210 - 190 * item["pitch"]
-            color = f"hsl({hue:.0f}, 70%, 62%)"
+        hue = EMOTION_HUE.get(item.get("emotion", "neutral"))
+        if hue is None:
+            # Нейтраль остаётся серой: приписывать ей цвет значило бы
+            # выдавать «модель ничего не нашла» за содержательный ответ.
+            light = 55 + 20 * item["loud"]
+            color = f"hsl(0, 0%, {light:.0f}%)"
         else:
-            color = "#9AA3AC"
+            sat = 35 + 45 * min(1.0, item.get("confidence", 0.0) * 2)
+            light = 48 + 22 * item["loud"]
+            color = f"hsl({hue}, {sat:.0f}%, {light:.0f}%)"
 
         weight = 400 + 400 * item["loud"]
         label = item.get("text") or f'{item["start"]:.1f}–{item["end"]:.1f}'
 
+        title = EMOTION_LABEL.get(item.get("emotion", ""), "")
+        if item.get("confidence"):
+            title += f' {item["confidence"]:.0%}'
+
         blocks.append(
-            f'<span style="color:{color};font-size:{size:.1f}px;'
+            f'<span title="{escape(title)}" style="color:{color};font-size:{size:.1f}px;'
             f'font-weight:{int(weight // 100 * 100)};'
             f'margin:0 .3em;display:inline-block;'
             f'text-shadow:0 1px 3px rgba(0,0,0,.8)">{escape(label)}</span>'
@@ -136,14 +171,17 @@ def on_click(audio_path):
         return "_Нәтиже жоқ_", render_card(None)
 
     lines = [
-        "| сөз | уақыт | қаттылық | биіктік |",
-        "|---|---|---|---|",
+        "| сөз | уақыт | эмоция | қаттылық | биіктік |",
+        "|---|---|---|---|---|",
     ]
     for item in result:
         pitch = f"{item['pitch']:.2f}" if item["voiced"] else "—"
+        label = EMOTION_LABEL.get(item.get("emotion", ""), "")
+        conf = f" {item['confidence']:.0%}" if item.get("confidence") else ""
         lines.append(
             f"| {item.get('text', '')} "
             f"| {item['start']:.2f}–{item['end']:.2f} с "
+            f"| {label}{conf} "
             f"| {item['loud']:.2f} | {pitch} |"
         )
 
