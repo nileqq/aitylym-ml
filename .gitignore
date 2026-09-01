@@ -5,3 +5,4 @@ IMPORTANT/
 __pycache__/
 *.pyc
 .gradio/
+future_work.md

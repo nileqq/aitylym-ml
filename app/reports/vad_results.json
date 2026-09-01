@@ -1,0 +1,114 @@
+{
+  "energy (librosa)|чистое": {
+    "recall": 0.8974358974358974,
+    "false_per_min": 14.423362293797373,
+    "boundary_err_ms": 55.18731699026164,
+    "speech_ratio": 0.738580510210982,
+    "rtf": 0.0002264230358494666
+  },
+  "WebRTC VAD (agg=2)|чистое": {
+    "recall": 0.9914529914529915,
+    "false_per_min": 2.324765251712675,
+    "boundary_err_ms": 82.31199788193409,
+    "speech_ratio": 0.8419617343876548,
+    "rtf": 0.00014389315189407452
+  },
+  "WebRTC VAD (agg=3)|чистое": {
+    "recall": 0.9743589743589745,
+    "false_per_min": 9.323150383500913,
+    "boundary_err_ms": 58.31546846627261,
+    "speech_ratio": 0.7872616337530176,
+    "rtf": 0.00014014391818331295
+  },
+  "Silero VAD|чистое": {
+    "recall": 0.9572649572649573,
+    "false_per_min": 4.739890183061324,
+    "boundary_err_ms": 61.011934514105754,
+    "speech_ratio": 0.8132062611177276,
+    "rtf": 0.014450276910032494
+  },
+  "energy (librosa)|SNR 20": {
+    "recall": 0.6324786324786325,
+    "false_per_min": 6.080537721736323,
+    "boundary_err_ms": 48.21120541017065,
+    "speech_ratio": 0.871046414515568,
+    "rtf": 0.0002151106051704121
+  },
+  "WebRTC VAD (agg=2)|SNR 20": {
+    "recall": 0.9145299145299145,
+    "false_per_min": 15.04064114630827,
+    "boundary_err_ms": 55.46433137496728,
+    "speech_ratio": 0.7427734211884648,
+    "rtf": 0.00012785805004504453
+  },
+  "WebRTC VAD (agg=3)|SNR 20": {
+    "recall": 0.5897435897435898,
+    "false_per_min": 42.549884354593374,
+    "boundary_err_ms": 75.36063048753039,
+    "speech_ratio": 0.40636230471518725,
+    "rtf": 0.00012864590991963173
+  },
+  "Silero VAD|SNR 20": {
+    "recall": 0.9145299145299145,
+    "false_per_min": 5.656542223149241,
+    "boundary_err_ms": 79.29553892755962,
+    "speech_ratio": 0.805428099525931,
+    "rtf": 0.01430291955283399
+  },
+  "energy (librosa)|SNR 10": {
+    "recall": 0.0,
+    "false_per_min": 0.0,
+    "boundary_err_ms": NaN,
+    "speech_ratio": 1.0,
+    "rtf": 0.00019364200661819682
+  },
+  "WebRTC VAD (agg=2)|SNR 10": {
+    "recall": 0.8632478632478633,
+    "false_per_min": 20.63695992783198,
+    "boundary_err_ms": 56.0853331977921,
+    "speech_ratio": 0.6948034428077294,
+    "rtf": 0.00014842014423693155
+  },
+  "WebRTC VAD (agg=3)|SNR 10": {
+    "recall": 0.35897435897435903,
+    "false_per_min": 40.859557328329096,
+    "boundary_err_ms": 89.58240925585547,
+    "speech_ratio": 0.18371720388046467,
+    "rtf": 0.00012942181392726384
+  },
+  "Silero VAD|SNR 10": {
+    "recall": 0.7948717948717948,
+    "false_per_min": 5.872797962414512,
+    "boundary_err_ms": 93.36212354158171,
+    "speech_ratio": 0.8005521181056414,
+    "rtf": 0.014263293905825127
+  },
+  "energy (librosa)|SNR 5": {
+    "recall": 0.0,
+    "false_per_min": 0.0,
+    "boundary_err_ms": NaN,
+    "speech_ratio": 1.0,
+    "rtf": 0.0001891069182648704
+  },
+  "WebRTC VAD (agg=2)|SNR 5": {
+    "recall": 0.0,
+    "false_per_min": 0.0,
+    "boundary_err_ms": NaN,
+    "speech_ratio": 0.9999260170977572,
+    "rtf": 0.00013370902859234724
+  },
+  "WebRTC VAD (agg=3)|SNR 5": {
+    "recall": 0.22222222222222224,
+    "false_per_min": 34.98693710036995,
+    "boundary_err_ms": 114.53933863340336,
+    "speech_ratio": 0.3795404207296933,
+    "rtf": 0.0001394094639337414
+  },
+  "Silero VAD|SNR 5": {
+    "recall": 0.6495726495726495,
+    "false_per_min": 5.705161904121195,
+    "boundary_err_ms": 91.0861667503669,
+    "speech_ratio": 0.7788508586722062,
+    "rtf": 0.014457820017235478
+  }
+}
