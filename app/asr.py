@@ -33,15 +33,22 @@ if str(_PROTOTYPE) not in sys.path:
 
 import omniasr_words
 
+# Какую модель брать по умолчанию. 300M — компромисс между качеством и
+# памятью: чекпоинт 1.3 ГБ против 3.9 ГБ у 1B, а пик при загрузке втрое
+# меньше. Доступны также CTC_3B_v2 и CTC_7B_v2.
+DEFAULT_MODEL = "omniASR_CTC_300M_v2"
+
 _pipeline = None
+_loaded_card = None
 
 
-def load():
+def load(model_card: str = DEFAULT_MODEL):
     """Грузит модель. Вызывать при старте приложения, а не в обработчике:
-    24 секунды ожидания по клику выглядят как зависание."""
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = omniasr_words.load_pipeline()
+    загрузка занимает 20-25 секунд и по клику выглядит как зависание."""
+    global _pipeline, _loaded_card
+    if _pipeline is None or _loaded_card != model_card:
+        _pipeline = omniasr_words.load_pipeline(model_card)
+        _loaded_card = model_card
     return _pipeline
 
 

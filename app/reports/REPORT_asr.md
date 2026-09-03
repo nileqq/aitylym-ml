@@ -179,4 +179,4 @@ python app/reports/wer_vs_length.py    # WER по диапазонам длит�
 python app/reports/wer_chunking.py    # целиком против порезанного
 ```
 
-Построчные результаты: `asr_wer_checkpoint.csv` (эталон, гипотеза, WER, CER по каждому клипу).
+Построчные результаты: `asr_wer_300m.csv` (эталон, гипотеза, WER, CER по каждому клипу).

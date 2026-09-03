@@ -39,7 +39,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 OUT_DIR = Path(__file__).resolve().parent
 
-CHECKPOINT = OUT_DIR / "asr_wer_checkpoint.csv"
+# Чекпоинт свой на каждую модель, иначе результаты смешаются.
+def checkpoint_for(model_card):
+    short = model_card.replace("omniASR_CTC_", "").replace("_v2", "")
+    return OUT_DIR / f"asr_wer_{short.lower()}.csv"
 FIELDS = ["sample_id", "reference", "hypothesis", "wer", "cer", "n_words"]
 
 # Пунктуация и регистр к делу не относятся: модель их не предсказывает,
@@ -114,16 +117,22 @@ def main():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--fresh", action="store_true", help="начать заново")
+    parser.add_argument("--model", default=None,
+                        help="карточка модели, например omniASR_CTC_1B_v2")
     args = parser.parse_args()
+
+    sys.path.insert(0, str(ROOT / "app"))
+    import asr
+
+    model_card = args.model or asr.DEFAULT_MODEL
+    global CHECKPOINT
+    CHECKPOINT = checkpoint_for(model_card)
 
     if args.fresh and CHECKPOINT.exists():
         CHECKPOINT.unlink()
 
     import jiwer
     import numpy as np
-
-    sys.path.insert(0, str(ROOT / "app"))
-    import asr
 
     rows = load_rows(args.limit)
     rows, dropped = drop_too_long(rows)
@@ -137,8 +146,8 @@ def main():
           f"осталось: {len(todo)}", flush=True)
 
     if todo:
-        print("загрузка модели...", flush=True)
-        pipeline = asr.load()
+        print(f"загрузка модели {model_card}...", flush=True)
+        pipeline = asr.load(model_card)
 
         new_file = not CHECKPOINT.exists()
         handle = CHECKPOINT.open("a", encoding="utf-8", newline="")
@@ -195,7 +204,7 @@ def main():
     weighted = float(np.sum(wer * words) / np.sum(words))
 
     print(f"\n{'=' * 46}")
-    print(f"OmniASR на собственном корпусе ({len(results)} клипов)")
+    print(f"{model_card} на собственном корпусе ({len(results)} клипов)")
     print("=" * 46)
     print(f"  WER взвешенный по словам : {weighted * 100:6.2f}%")
     print(f"  WER среднее по клипам    : {wer.mean() * 100:6.2f}%")
