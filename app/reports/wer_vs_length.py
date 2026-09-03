@@ -15,9 +15,11 @@ import soundfile as sf
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).resolve().parent.parent.parent
+name = sys.argv[1] if len(sys.argv) > 1 else "asr_wer_300m.csv"
 rows = list(csv.DictReader(
-    open(Path(__file__).parent / "asr_wer_checkpoint.csv", encoding="utf-8")
+    open(Path(__file__).parent / name, encoding="utf-8")
 ))
+print(f"файл: {name}")
 
 dur, wer, cer, words = [], [], [], []
 for row in rows:
