@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -33,10 +34,19 @@ if str(_PROTOTYPE) not in sys.path:
 
 import omniasr_words
 
-# Какую модель брать по умолчанию. 300M — компромисс между качеством и
-# памятью: чекпоинт 1.3 ГБ против 3.9 ГБ у 1B, а пик при загрузке втрое
-# меньше. Доступны также CTC_3B_v2 и CTC_7B_v2.
-DEFAULT_MODEL = "omniASR_CTC_300M_v2"
+# Какую модель брать. Измерено на своём корпусе (см. reports/REPORT_asr.md):
+#
+#   300M  WER 63.2%   чекпоинт 1.3 ГБ   24 клип/с
+#   1B    WER 49.0%   чекпоинт 3.9 ГБ   16 клип/с
+#
+# 1B заметно лучше, но требует GPU и свопа под пик загрузки. На бесплатном
+# HF Spaces видеокарты нет и два ядра CPU, поэтому там остаётся 300M —
+# иначе холодный старт тянет 3.9 ГБ, а инференс идёт минутами.
+#
+# Переключается переменной окружения, чтобы одно и то же приложение
+# работало и локально на GPU, и на Spaces:
+#     AITYLYM_ASR_MODEL=omniASR_CTC_1B_v2
+DEFAULT_MODEL = os.environ.get("AITYLYM_ASR_MODEL", "omniASR_CTC_300M_v2")
 
 _pipeline = None
 _loaded_card = None
