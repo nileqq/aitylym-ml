@@ -54,7 +54,9 @@ def process(audio_path):
     # Эмоция — на фразе, не на слове. На 300-500 мс модель неработоспособна:
     # там побеждает фонетика, а не подача (замерено — смена текста двигает
     # эмбеддинг в 2.29 раза сильнее, чем смена эмоции).
-    groups = emotion.group_words(spans)
+    # segments от VAD — единственный источник пауз: границы слов от CTC
+    # идут впритык, и по ним резать нечего.
+    groups = emotion.group_words(spans, segments)
     phrase_spans = [(spans[g[0]][0], spans[g[-1]][1]) for g in groups]
     phrase_probs = emotion.predict(y, sr, phrase_spans)
 
@@ -201,5 +203,36 @@ with gr.Blocks(title="AItylym") as demo:
     run.click(on_click, audio, [output, card])
 
 
+def warm_up():
+    """Грузит модели до старта интерфейса.
+
+    Иначе первый клик молча висит: OmniASR 300M грузится около 25 секунд,
+    1B с примонтированного диска — до двух с половиной минут. Пользователь
+    решит, что приложение зависло, и нажмёт ещё раз.
+    """
+    import time
+
+    print(f"Загрузка моделей ({asr.DEFAULT_MODEL})...", flush=True)
+    started = time.perf_counter()
+
+    asr.load()
+    emotion.load()
+
+    print(f"Готово за {time.perf_counter() - started:.0f} с", flush=True)
+
+
 if __name__ == "__main__":
-    demo.launch()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--share", action="store_true",
+                        help="публичная ссылка gradio.live")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--skip-warmup", action="store_true",
+                        help="не прогревать: быстрый старт, долгий первый клик")
+    args = parser.parse_args()
+
+    if not args.skip_warmup:
+        warm_up()
+
+    demo.launch(share=args.share, server_port=args.port)

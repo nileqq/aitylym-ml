@@ -75,37 +75,104 @@ _device = None
 # ----------------------------------------------------------------------------
 
 
-def group_words(spans: list) -> list:
+def group_words(spans: list, speech: list = None) -> list:
     """Слова -> фразы. Возвращает список списков индексов слов.
 
-    Режем по паузам, но следим за длиной: слишком короткая фраза для модели
-    бесполезна, слишком длинная смешивает разные эмоции.
+    Паузы берутся из отрезков VAD, а не из границ слов. Это важно:
+    границы слов приходят из пиков CTC и идут ВПРИТЫК — конец одного слова
+    равен началу следующего, пауза между ними всегда ровно ноль. Резать по
+    ним нечего, и без отрезков VAD вся запись слипается в одну фразу.
+
+    Args:
+        spans: границы слов [(начало, конец), ...].
+        speech: отрезки речи от VAD. Без них остаётся только деление по
+            длине — грубо, но лучше, чем одна фраза на всё.
     """
     if not spans:
         return []
 
+    if speech:
+        groups = _group_by_speech(spans, speech)
+    else:
+        groups = _group_by_length(spans)
+
+    return _merge_short(groups, spans)
+
+
+def _group_by_speech(spans: list, speech: list) -> list:
+    """Каждое слово относим к отрезку VAD, внутри которого оно звучит."""
+    groups, current, segment = [], [], 0
+
+    for i, (start, end) in enumerate(spans):
+        middle = (start + end) / 2
+
+        # Догоняем отрезок, в котором находится середина слова
+        while segment < len(speech) - 1 and middle > speech[segment][1]:
+            segment += 1
+
+        if current and segment != current[0]:
+            groups.append(current[1])
+            current = None
+
+        if not current:
+            current = (segment, [])
+        current[1].append(i)
+
+    if current:
+        groups.append(current[1])
+
+    # Отрезок VAD может оказаться длиннее, чем модель переносит: тогда в
+    # одну фразу попадут несколько разных эмоций. Делим такие по длине.
+    out = []
+    for group in groups:
+        if spans[group[-1]][1] - spans[group[0]][0] > PHRASE_MAX_SEC:
+            out.extend(_group_by_length([spans[i] for i in group], group))
+        else:
+            out.append(group)
+    return out
+
+
+def _group_by_length(spans: list, index_map: list = None) -> list:
+    """Запасной вариант: режем просто по длине."""
     groups, current = [], [0]
 
     for i in range(1, len(spans)):
-        gap = spans[i][0] - spans[i - 1][1]
-        span = spans[i][1] - spans[current[0]][0]
-
-        if (gap >= PHRASE_GAP_SEC or span > PHRASE_MAX_SEC) and \
-                spans[i - 1][1] - spans[current[0]][0] >= PHRASE_MIN_SEC:
+        if spans[i][1] - spans[current[0]][0] > PHRASE_MAX_SEC:
             groups.append(current)
             current = [i]
         else:
             current.append(i)
-
     groups.append(current)
 
-    # Короткий хвост приклеиваем к предыдущей фразе, а не оставляем огрызком.
-    if len(groups) > 1:
-        last = groups[-1]
-        if spans[last[-1]][1] - spans[last[0]][0] < PHRASE_MIN_SEC:
-            groups[-2].extend(groups.pop())
-
+    if index_map:
+        return [[index_map[i] for i in g] for g in groups]
     return groups
+
+
+def _merge_short(groups: list, spans: list) -> list:
+    """Приклеивает слишком короткие фразы к соседям.
+
+    Модель обучалась на клипах от секунды и на огрызках неработоспособна,
+    поэтому лучше слить две короткие фразы, чем скормить ей обрывок.
+    """
+    if len(groups) < 2:
+        return groups
+
+    out = [groups[0]]
+    for group in groups[1:]:
+        previous = out[-1]
+        if spans[previous[-1]][1] - spans[previous[0]][0] < PHRASE_MIN_SEC:
+            previous.extend(group)
+        else:
+            out.append(list(group))
+
+    # Хвост тоже может остаться коротким
+    if len(out) > 1:
+        last = out[-1]
+        if spans[last[-1]][1] - spans[last[0]][0] < PHRASE_MIN_SEC:
+            out[-2].extend(out.pop())
+
+    return out
 
 
 # ----------------------------------------------------------------------------
